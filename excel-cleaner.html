@@ -114,13 +114,13 @@
   <div class="panel">
     <h2>1. Upload</h2>
     <div class="drop" id="dropZone">
-      <input type="file" id="fileInput" accept=".xlsx,.xls,.csv">
+      <input type="file" id="fileInput" accept=".xlsx,.xls,.csv,.sql">
       <p><strong>Click to choose a file</strong> or drag one here</p>
-      <p>.xlsx, .xls, or .csv</p>
+      <p>.xlsx, .xls, .csv, or .sql</p>
     </div>
     <div class="filemeta" id="fileMeta"></div>
     <div class="sheet-select" id="sheetSelectWrap" style="display:none;">
-      <label style="font-size:0.85rem; color:var(--muted); margin-right:8px;">Sheet:</label>
+      <label style="font-size:0.85rem; color:var(--muted); margin-right:8px;" id="sheetSelectLabel">Sheet:</label>
       <select id="sheetSelect"></select>
     </div>
   </div>
@@ -226,7 +226,37 @@
 
   function handleFile(file){
     currentFilename = file.name.replace(/\.[^.]+$/, '') + '_cleaned';
+    const isSQL = /\.sql$/i.test(file.name);
     const reader = new FileReader();
+
+    if(isSQL){
+      reader.onload = function(e){
+        try{
+          const tables = parseSQLDump(e.target.result);
+          const names = Object.keys(tables);
+          if(names.length === 0){ showToast('No INSERT/CREATE TABLE statements found in this .sql file'); return; }
+          workbookSheets = {};
+          names.forEach(function(t){
+            workbookSheets[t] = [tables[t].columns].concat(tables[t].rows);
+          });
+          fileMeta.textContent = file.name + ' — ' + names.length + ' table(s) detected';
+          document.getElementById('sheetSelectLabel').textContent = 'Table:';
+          sheetSelect.innerHTML = '';
+          names.forEach(function(name){
+            const opt = document.createElement('option');
+            opt.value = name; opt.textContent = name + ' (' + tables[name].rows.length + ' rows)';
+            sheetSelect.appendChild(opt);
+          });
+          sheetSelectWrap.style.display = names.length > 1 ? 'block' : 'none';
+          loadSheet(names[0]);
+        }catch(err){
+          showToast('Could not parse SQL file: ' + err.message);
+        }
+      };
+      reader.readAsText(file);
+      return;
+    }
+
     reader.onload = function(e){
       try{
         const data = new Uint8Array(e.target.result);
@@ -236,6 +266,7 @@
           workbookSheets[name] = XLSX.utils.sheet_to_json(wb.Sheets[name], {header:1, defval:''});
         });
         fileMeta.textContent = file.name + ' — ' + wb.SheetNames.length + ' sheet(s)';
+        document.getElementById('sheetSelectLabel').textContent = 'Sheet:';
         sheetSelect.innerHTML = '';
         wb.SheetNames.forEach(function(name){
           const opt = document.createElement('option');
@@ -249,6 +280,78 @@
       }
     };
     reader.readAsArrayBuffer(file);
+  }
+
+  // ---------- SQL dump parsing ----------
+  function splitSQLTuples(valuesStr){
+    const tuples = [];
+    let i = 0, n = valuesStr.length;
+    while(i < n){
+      while(i < n && valuesStr[i] !== '(') i++;
+      if(i >= n) break;
+      i++;
+      const row = []; let cur = ''; let inStr = false; let quoteChar = ''; let depth = 0;
+      while(i < n){
+        const ch = valuesStr[i];
+        if(inStr){
+          if(ch === '\\' && i+1 < n){ cur += ch + valuesStr[i+1]; i += 2; continue; }
+          if(ch === quoteChar){
+            if(valuesStr[i+1] === quoteChar){ cur += ch; i += 2; continue; }
+            inStr = false; cur += ch; i++; continue;
+          }
+          cur += ch; i++; continue;
+        }
+        if(ch === "'" || ch === '"'){ inStr = true; quoteChar = ch; cur += ch; i++; continue; }
+        if(ch === '('){ depth++; cur += ch; i++; continue; }
+        if(ch === ')'){
+          if(depth === 0){ row.push(cur.trim()); cur = ''; i++; break; }
+          depth--; cur += ch; i++; continue;
+        }
+        if(ch === ',' && depth === 0){ row.push(cur.trim()); cur = ''; i++; continue; }
+        cur += ch; i++;
+      }
+      if(row.length) tuples.push(row);
+    }
+    return tuples;
+  }
+
+  function cleanSQLValue(v){
+    if(v === undefined) return '';
+    if(/^NULL$/i.test(v.trim())) return '';
+    const t = v.trim();
+    if((t.startsWith("'") && t.endsWith("'")) || (t.startsWith('"') && t.endsWith('"'))){
+      let inner = t.slice(1, -1);
+      inner = inner.replace(/\\'/g, "'").replace(/\\"/g, '"').replace(/''/g, "'").replace(/\\\\/g, '\\').replace(/\\n/g, '\n');
+      return inner;
+    }
+    return t;
+  }
+
+  function parseSQLDump(text){
+    const tables = {};
+    const createRe = /CREATE TABLE\s+(?:IF NOT EXISTS\s+)?`?(\w+)`?\s*\(([\s\S]*?)\)\s*(?:ENGINE|;|\)\s*;)/gi;
+    let m;
+    while((m = createRe.exec(text))){
+      const tname = m[1];
+      const cols = [];
+      m[2].split(/,(?![^(]*\))/).forEach(function(line){
+        const lm = line.trim().match(/^`?(\w+)`?\s+/);
+        if(lm && !/^(PRIMARY|UNIQUE|KEY|CONSTRAINT|FOREIGN|INDEX)$/i.test(lm[1])) cols.push(lm[1]);
+      });
+      if(cols.length) tables[tname] = {columns: cols, rows: []};
+    }
+    const insertRe = /INSERT INTO\s+`?(\w+)`?\s*(\([^)]*\))?\s*VALUES\s*([\s\S]*?);/gi;
+    while((m = insertRe.exec(text))){
+      const tname = m[1];
+      let cols = null;
+      if(m[2]) cols = m[2].replace(/[()]/g,'').split(',').map(function(c){ return c.trim().replace(/`/g,''); });
+      const tuples = splitSQLTuples(m[3]);
+      if(!tuples.length) continue;
+      if(!tables[tname]) tables[tname] = {columns: cols || tuples[0].map(function(_,i){ return 'col'+(i+1); }), rows: []};
+      if(cols && cols.length) tables[tname].columns = cols;
+      tuples.forEach(function(tuple){ tables[tname].rows.push(tuple.map(cleanSQLValue)); });
+    }
+    return tables;
   }
 
   sheetSelect.addEventListener('change', function(){ loadSheet(sheetSelect.value); });
